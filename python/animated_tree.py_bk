@@ -1,0 +1,616 @@
+#!/usr/bin/env python3
+"""
+Animated Christmas tree rendered in terminal using curses.
+
+Features:
+- Spiral lights (yellow/white/red) with flicker
+- Bokeh background
+- Falling snow and ground accumulation
+- Twinkling star at the top
+
+Quit: press 'q'
+"""
+
+import curses
+import locale
+import math
+import random
+import time
+
+locale.setlocale(locale.LC_ALL, "")
+
+# ================== 튜닝 ==================
+TREE_HEIGHT = 28
+FRAME_DT = 0.055
+
+# 조명(나선 스트링)
+STRING_COUNT = 5
+STRING_BULB_STEP = 1
+STRING_SPEED = 0.75
+STRING_TWINKLE = 0.04
+
+# 미세 점광(과하면 흐릿해짐)
+FAIRY_RATE = 0.015
+
+# 눈
+SNOW_SPAWN_BACK = 0.022
+SNOW_SPAWN_FRONT = 0.013
+SNOW_DRIFT = 0.26
+GROUND_ACCUM_MAX = 3
+GROUND_SMOOTHING = 0.10
+
+# 가지 눈
+BRANCH_SNOW_RATE = 0.05
+BRANCH_SNOW_DECAY = 0.015
+
+# 보케
+BOKEH_COUNT = 12
+BOKEH_MAX_Y = 9
+BOKEH_DRIFT = 0.18
+BOKEH_PULSE = 0.9
+# ==========================================
+
+LEAF_BASE = "▲"
+LEAF_VARIANTS = ["▲", "▴", "▵"]
+SNOW_BACK_CHARS = ["·", ".", "˙"]
+SNOW_FRONT_CHARS = ["*", "+", "❄", "✼"]
+BOKEH_CHARS = ["○", "◌", "◯", "∙", "·"]
+
+
+def clamp(v: int, lo: int, hi: int) -> int:
+    """Clamp integer v to [lo, hi]."""
+    return lo if v < lo else hi if v > hi else v
+
+
+def safe_add(stdscr, y: int, x: int, s: str, attr: int = 0) -> None:
+    """Safely draw text to curses screen; ignore out-of-bounds errors."""
+    try:
+        stdscr.addstr(y, x, s, attr)
+    except curses.error:
+        pass
+
+
+def init_colors() -> dict[str, int]:
+    """Initialize curses color pairs and return a name->pair_id mapping."""
+    curses.start_color()
+    curses.use_default_colors()
+    P = {
+        "GREEN": 1,
+        "RED": 2,
+        "YELLOW": 3,
+        "BLUE": 4,
+        "MAGENTA": 5,
+        "CYAN": 6,
+        "WHITE": 7,
+    }
+    curses.init_pair(P["GREEN"], curses.COLOR_GREEN, -1)
+    curses.init_pair(P["RED"], curses.COLOR_RED, -1)
+    curses.init_pair(P["YELLOW"], curses.COLOR_YELLOW, -1)
+    curses.init_pair(P["BLUE"], curses.COLOR_BLUE, -1)
+    curses.init_pair(P["MAGENTA"], curses.COLOR_MAGENTA, -1)
+    curses.init_pair(P["CYAN"], curses.COLOR_CYAN, -1)
+    curses.init_pair(P["WHITE"], curses.COLOR_WHITE, -1)
+    return P
+
+
+def build_tree(height: int):
+    """Build tree geometry (leaves + trunk) and return width/height and cell sets."""
+    width = 2 * height - 1
+    leaves: set[tuple[int, int]] = set()
+    for r in range(height):
+        w = 2 * r + 1
+        pad = (width - w) // 2
+        for j in range(w):
+            leaves.add((r, pad + j))
+
+    trunk_h = max(2, height // 4)
+    trunk_w = max(3, (height // 6) * 2 + 1)
+    trunk_pad = (width - trunk_w) // 2
+    trunk: set[tuple[int, int]] = set()
+    base_r = height
+    for rr in range(trunk_h):
+        r = base_r + rr
+        for j in range(trunk_w):
+            trunk.add((r, trunk_pad + j))
+
+    total_h = height + trunk_h
+    return width, total_h, leaves, trunk
+
+
+def classify_leaf_edges(leaves: set[tuple[int, int]]) -> set[tuple[int, int]]:
+    """Return leaf cells that are on the outer edge for bolder rendering."""
+    edge: set[tuple[int, int]] = set()
+    for (r, c) in leaves:
+        if (
+            (r, c - 1) not in leaves
+            or (r, c + 1) not in leaves
+            or (r - 1, c) not in leaves
+            or (r + 1, c) not in leaves
+        ):
+            edge.add((r, c))
+    return edge
+
+
+def init_bokeh(max_x: int, max_y: int, P: dict[str, int]) -> list[dict]:
+    """Initialize bokeh particles for background ambience."""
+    bokeh: list[dict] = []
+    colors = [P["YELLOW"], P["CYAN"], P["MAGENTA"], P["WHITE"], P["BLUE"]]
+    for _ in range(BOKEH_COUNT):
+        bokeh.append(
+            {
+                "x": random.uniform(0, max_x - 1),
+                "y": random.uniform(0, max(1, min(BOKEH_MAX_Y, max_y - 2))),
+                "vx": random.uniform(-1, 1) * BOKEH_DRIFT,
+                "vy": random.uniform(-1, 1) * (BOKEH_DRIFT * 0.35),
+                "phase": random.uniform(0, 2 * math.pi),
+                "pair": random.choice(colors),
+                "ch": random.choice(BOKEH_CHARS),
+            }
+        )
+    return bokeh
+
+
+def build_spiral_lights(
+    height: int,
+    leaves: set[tuple[int, int]],
+    count: int,
+    bulb_step: int,
+    P: dict[str, int],
+):
+    """Build spiral wire path and bulb positions for tree lighting."""
+    width = 2 * height - 1
+    center = width // 2
+    turns = 4.15
+
+    bulbs: list[dict] = []
+    wires: set[tuple[int, int]] = set()
+
+    for si in range(count):
+        offset = (2 * math.pi) * (si / max(1, count))
+        prev: tuple[int, int] | None = None
+
+        for r in range(2, height):
+            w = 2 * r + 1
+            pad = (width - w) // 2
+            radius = (w - 1) / 2.0
+            y = r / (height - 1)
+
+            theta = y * turns * 2 * math.pi + offset
+            c = round(center + math.cos(theta) * radius)
+            c = clamp(c, pad, pad + w - 1)
+            depth = math.sin(theta)
+
+            if prev is not None:
+                _, pc = prev
+                step = 1 if c >= pc else -1
+                cc = pc
+                for _ in range(2):
+                    if cc == c:
+                        break
+                    cc += step
+                    if (r, cc) in leaves:
+                        wires.add((r, cc))
+                if (r, c) in leaves:
+                    wires.add((r, c))
+
+            if r % bulb_step == (si % bulb_step) and (r, c) in leaves:
+                # 빨강 포인트: yellow 70% / white 15% / red 15%
+                p = random.random()
+                if p < 0.70:
+                    pair = P["YELLOW"]
+                elif p < 0.85:
+                    pair = P["WHITE"]
+                else:
+                    pair = P["RED"]
+
+                bulbs.append(
+                    {
+                        "r": r,
+                        "c": c,
+                        "depth": depth,
+                        "phase": random.uniform(0, 2 * math.pi),
+                        "pair": pair,
+                    }
+                )
+
+                if random.random() < 0.22:
+                    side = c + random.choice([-2, 2])
+                    if (r, side) in leaves:
+                        bulbs.append(
+                            {
+                                "r": r,
+                                "c": side,
+                                "depth": depth * 0.6,
+                                "phase": random.uniform(0, 2 * math.pi),
+                                "pair": pair,
+                            }
+                        )
+
+            prev = (r, c)
+
+    return wires, bulbs
+
+
+def draw_big_star(stdscr, top_y: int, center_x: int, P: dict[str, int], t: float) -> None:
+    """Draw a 9x5 star with a twinkling core and subtle glow."""
+    phase = int(t * 8) % 4
+    core = "★" if phase in (0, 2) else "✶"
+
+    tw = 0.5 + 0.5 * math.sin(t * 3.0)
+    sparkle = 0.5 + 0.5 * math.sin(t * 7.5 + 1.7)
+
+    pair = P["WHITE"] if sparkle > 0.82 else P["YELLOW"]
+    core_attr = curses.color_pair(pair) | curses.A_BOLD
+    arm_attr = curses.color_pair(pair) | (curses.A_BOLD if tw > 0.35 else 0)
+    dim_attr = curses.color_pair(pair) | curses.A_DIM
+
+    rows = [
+        "    ●    ",
+        "  ●●●●●  ",
+        f"●●●●{core}●●●●",
+        "  ●●●●●  ",
+        "    ●    ",
+    ]
+
+    if sparkle > 0.55:
+        glow_attr = curses.color_pair(pair) | curses.A_DIM
+        for dx, dy in [(-5, 2), (5, 2), (0, -1), (0, 6), (-3, 0), (3, 0), (-4, 4), (4, 4)]:
+            if random.random() < 0.35:
+                safe_add(stdscr, top_y + dy, center_x + dx, "·", glow_attr)
+
+    for rr, line in enumerate(rows):
+        for i, ch in enumerate(line):
+            if ch == " ":
+                continue
+            x = center_x - 4 + i
+            y = top_y + rr
+            if ch == core:
+                safe_add(stdscr, y, x, ch, core_attr)
+            elif ch == "●":
+                a = arm_attr if sparkle > 0.35 else dim_attr
+                safe_add(stdscr, y, x, ch, a)
+
+
+def spawn_snow(layer: list[dict], n: int, chars: list[str], vy_lo: float, vy_hi: float, max_x: int) -> None:
+    """Spawn n snow particles into the given layer."""
+    for _ in range(n):
+        layer.append(
+            {
+                "x": random.randrange(0, max_x),
+                "y": 0.0,
+                "vy": random.uniform(vy_lo, vy_hi),
+                "ch": random.choice(chars),
+                "dr": random.uniform(-1, 1),
+            }
+        )
+
+
+def update_snow(
+    layer: list[dict],
+    *,
+    dt: float,
+    heavy: bool,
+    max_x: int,
+    max_y: int,
+    top: int,
+    left: int,
+    tree_height: int,
+    tree_w: int,
+    leaves: set[tuple[int, int]],
+    branch_snow: dict[tuple[int, int], float],
+    wind: float,
+    ground_y: int,
+    ground_acc: list[int],
+) -> list[dict]:
+    """Advance snow particles and apply branch/ground accumulation."""
+    new_layer: list[dict] = []
+
+    for p in layer:
+        p["y"] += p["vy"] * dt
+        drift = (p["dr"] * SNOW_DRIFT + wind * 0.18) * (1.6 if heavy else 1.0)
+
+        if random.random() < 0.65:
+            p["x"] = (p["x"] + round(drift)) % max_x
+
+        yy = int(p["y"])
+        xx = p["x"]
+
+        tr = yy - top
+        tc = xx - left
+
+        if 0 <= tr < tree_height and 0 <= tc < tree_w and (tr, tc) in leaves:
+            if random.random() < BRANCH_SNOW_RATE:
+                branch_snow[(tr, tc)] = min(1.0, branch_snow.get((tr, tc), 0.0) + 0.35)
+                continue
+
+        if yy >= ground_y:
+            ground_acc[xx] = clamp(ground_acc[xx] + 1, 0, GROUND_ACCUM_MAX)
+            continue
+
+        if yy >= max_y - 1:
+            continue
+
+        new_layer.append(p)
+
+    return new_layer
+
+
+def main(stdscr) -> None:
+    """Main curses loop: update simulation state and render each frame."""
+    curses.curs_set(0)
+    stdscr.nodelay(True)
+    stdscr.keypad(True)
+
+    P = init_colors()
+    tree_w, tree_h, leaves, trunk = build_tree(TREE_HEIGHT)
+    leaf_edges = classify_leaf_edges(leaves)
+
+    wires, bulbs = build_spiral_lights(TREE_HEIGHT, leaves, STRING_COUNT, STRING_BULB_STEP, P)
+
+    branch_snow: dict[tuple[int, int], float] = {}
+    snow_back: list[dict] = []
+    snow_front: list[dict] = []
+    ground_acc: list[int] = []
+    bokeh: list[dict] | None = None
+
+    t0 = time.monotonic()
+    last = t0
+
+    while True:
+        now = time.monotonic()
+        dt = now - last
+        if dt <= 0:
+            dt = FRAME_DT
+        last = now
+
+        key = stdscr.getch()
+        if key == ord("q"):
+            break
+
+        max_y, max_x = stdscr.getmaxyx()
+        min_need_y = tree_h + 10
+        min_need_x = tree_w + 28
+        if max_y < min_need_y or max_x < min_need_x:
+            stdscr.erase()
+            safe_add(stdscr, 0, 0, "터미널 창을 더 크게 해주세요. (q로 종료)")
+            safe_add(stdscr, 1, 0, f"최소: {min_need_x}x{min_need_y} / 현재: {max_x}x{max_y}")
+            stdscr.refresh()
+            time.sleep(0.10)
+            continue
+
+        if bokeh is None:
+            bokeh = init_bokeh(max_x, max_y, P)
+
+        top = (max_y - tree_h) // 2
+        left = (max_x - tree_w) // 2
+        ground_y = clamp(top + tree_h + 2, 0, max_y - 3)
+
+        if len(ground_acc) != max_x:
+            ground_acc = [0] * max_x
+
+        wind = math.sin((now - t0) * 0.6) * 0.8
+
+        spawn_back = int(max_x * SNOW_SPAWN_BACK * (dt / FRAME_DT))
+        spawn_front = int(max_x * SNOW_SPAWN_FRONT * (dt / FRAME_DT))
+
+        spawn_snow(snow_back, spawn_back, SNOW_BACK_CHARS, 5.0, 10.0, max_x)
+        spawn_snow(snow_front, spawn_front, SNOW_FRONT_CHARS, 8.0, 15.0, max_x)
+
+        snow_back = update_snow(
+            snow_back,
+            dt=dt,
+            heavy=False,
+            max_x=max_x,
+            max_y=max_y,
+            top=top,
+            left=left,
+            tree_height=TREE_HEIGHT,
+            tree_w=tree_w,
+            leaves=leaves,
+            branch_snow=branch_snow,
+            wind=wind,
+            ground_y=ground_y,
+            ground_acc=ground_acc,
+        )
+        snow_front = update_snow(
+            snow_front,
+            dt=dt,
+            heavy=True,
+            max_x=max_x,
+            max_y=max_y,
+            top=top,
+            left=left,
+            tree_height=TREE_HEIGHT,
+            tree_w=tree_w,
+            leaves=leaves,
+            branch_snow=branch_snow,
+            wind=wind,
+            ground_y=ground_y,
+            ground_acc=ground_acc,
+        )
+
+        if GROUND_SMOOTHING > 0:
+            for _ in range(2):
+                i = random.randrange(1, max_x - 1)
+                if random.random() < GROUND_SMOOTHING:
+                    avg = (ground_acc[i - 1] + ground_acc[i] + ground_acc[i + 1]) / 3.0
+                    ground_acc[i] = round(avg)
+
+        if branch_snow:
+            for k in list(branch_snow.keys()):
+                branch_snow[k] -= BRANCH_SNOW_DECAY
+                if branch_snow[k] <= 0:
+                    del branch_snow[k]
+
+        # ====== 렌더 ======
+        stdscr.erase()
+
+        # 0) 보케
+        for b in bokeh:
+            b["x"] += b["vx"] * (dt / FRAME_DT)
+            b["y"] += b["vy"] * (dt / FRAME_DT)
+
+            if b["x"] < -2:
+                b["x"] = max_x + 1
+            if b["x"] > max_x + 2:
+                b["x"] = -1
+
+            y_max = min(BOKEH_MAX_Y, max_y - 2)
+            if b["y"] < 0:
+                b["y"] = 0
+                b["vy"] *= -1
+            if b["y"] > y_max:
+                b["y"] = y_max
+                b["vy"] *= -1
+
+            pulse = math.sin((now - t0) * BOKEH_PULSE + b["phase"])
+            bright = pulse > 0.35
+            center_attr = curses.color_pair(b["pair"]) | (curses.A_BOLD if bright else curses.A_DIM)
+
+            cx, cy = int(b["x"]), int(b["y"])
+            if 0 <= cy < max_y and 0 <= cx < max_x:
+                safe_add(stdscr, cy, cx, b["ch"], center_attr)
+
+            haze_attr = curses.color_pair(b["pair"]) | curses.A_DIM
+            for dx, dy in [(-2, 0), (2, 0), (0, -1), (0, 1), (-1, -1), (1, 1)]:
+                if random.random() < 0.55:
+                    x2, y2 = cx + dx, cy + dy
+                    if 0 <= y2 < max_y and 0 <= x2 < max_x:
+                        safe_add(stdscr, y2, x2, "·", haze_attr)
+
+        # 1) 배경 눈
+        back_attr = curses.color_pair(P["WHITE"]) | curses.A_DIM
+        for p in snow_back:
+            y = int(p["y"])
+            x = p["x"]
+            if 0 <= y < max_y and 0 <= x < max_x:
+                safe_add(stdscr, y, x, p["ch"], back_attr)
+
+        # 2) 큰 별
+        star_top_y = clamp(top - 2, 0, max_y - 6)
+        star_center_x = clamp(left + tree_w // 2, 4, max_x - 5)
+        draw_big_star(stdscr, star_top_y, star_center_x, P, (now - t0))
+
+        # 3) 와이어(점선) - GREEN DIM
+        wire_attr = curses.color_pair(P["GREEN"]) | curses.A_DIM
+        for (r, c) in wires:
+            y = top + r
+            x = left + c
+            if 0 <= y < max_y and 0 <= x < max_x:
+                safe_add(stdscr, y, x, "·", wire_attr)
+
+        # 4) 트리
+        leaf_edge_attr = curses.color_pair(P["GREEN"]) | curses.A_BOLD
+        leaf_inner_attr = curses.color_pair(P["GREEN"])
+        for (r, c) in leaves:
+            y = top + r
+            x = left + c
+            if 0 <= y < max_y and 0 <= x < max_x:
+                ch = LEAF_BASE
+                if (r % 3 == 0 and c % 2 == 0) or (r % 5 == 0):
+                    ch = random.choice(LEAF_VARIANTS)
+                attr = leaf_edge_attr if (r, c) in leaf_edges else leaf_inner_attr
+                safe_add(stdscr, y, x, ch, attr)
+
+        # 5) 전구 (DIM 제거)
+        t = now - t0
+        for b in bulbs:
+            r, c = b["r"], b["c"]
+            y = top + r
+            x = left + c
+            if not (0 <= y < max_y and 0 <= x < max_x):
+                continue
+
+            front = 1.0 if b["depth"] > 0 else 0.0
+            base = 0.78 + 0.14 * front
+            flicker = 0.94 + 0.06 * math.sin(t * STRING_SPEED + b["phase"])
+            if random.random() < STRING_TWINKLE:
+                flicker *= random.uniform(0.97, 1.03)
+
+            bright = base * flicker
+            pair = b["pair"]
+
+            if bright > 0.92:
+                ch = "●"
+                attr = curses.color_pair(pair) | curses.A_BOLD
+            elif bright > 0.82:
+                ch = "●"
+                attr = curses.color_pair(pair)
+            else:
+                ch = "o"
+                attr = curses.color_pair(pair)
+
+            safe_add(stdscr, y, x, ch, attr)
+
+            if bright > 0.86:
+                glow = curses.color_pair(pair) | curses.A_DIM
+                for dx, dy in [(1, 0), (-1, 0), (0, 1), (0, -1)]:
+                    if random.random() < 0.20:
+                        xx, yy = x + dx, y + dy
+                        if 0 <= yy < max_y and 0 <= xx < max_x:
+                            safe_add(stdscr, yy, xx, "·", glow)
+
+        # 6) 미세 점광
+        fairy_attr = curses.color_pair(P["WHITE"]) | curses.A_DIM
+        if FAIRY_RATE > 0:
+            for (r, c) in leaves:
+                if random.random() < FAIRY_RATE:
+                    y = top + r
+                    x = left + c
+                    if 0 <= y < max_y and 0 <= x < max_x:
+                        safe_add(stdscr, y, x, "·", fairy_attr)
+
+        # 7) 가지 눈
+        for (r, c), intensity in branch_snow.items():
+            y = top + r
+            x = left + c
+            if 0 <= y < max_y and 0 <= x < max_x:
+                ch = "˙" if intensity < 0.4 else "·" if intensity < 0.75 else "❅"
+                attr = curses.color_pair(P["WHITE"]) | (curses.A_DIM if intensity < 0.6 else curses.A_BOLD)
+                safe_add(stdscr, y, x, ch, attr)
+
+        # 8) 줄기
+        mid = left + tree_w // 2
+        for (r, c) in trunk:
+            y = top + r
+            x = left + c
+            if 0 <= y < max_y and 0 <= x < max_x:
+                dist = abs(x - mid)
+                attr = curses.color_pair(P["WHITE"]) | (curses.A_DIM if dist > 1 else curses.A_BOLD)
+                safe_add(stdscr, y, x, "█", attr)
+
+        # 9) 바닥 + 누적 눈
+        base_attr = curses.color_pair(P["WHITE"]) | curses.A_DIM
+        snow_bold = curses.color_pair(P["WHITE"]) | curses.A_BOLD
+
+        for x in range(max_x):
+            safe_add(stdscr, ground_y, x, "_", base_attr)
+
+        for x in range(max_x):
+            h = ground_acc[x]
+            if h >= 1:
+                safe_add(stdscr, ground_y, x, "▁", snow_bold)
+            if h >= 2 and ground_y - 1 >= 0:
+                safe_add(stdscr, ground_y - 1, x, "·", base_attr)
+            if h >= 3 and ground_y - 2 >= 0:
+                safe_add(stdscr, ground_y - 2, x, "˙", base_attr)
+
+        # 10) 전경 눈
+        front_attr = curses.color_pair(P["CYAN"]) | curses.A_BOLD
+        for p in snow_front:
+            y = int(p["y"])
+            x = p["x"]
+            if 0 <= y < max_y and 0 <= x < max_x:
+                safe_add(stdscr, y, x, p["ch"], front_attr)
+
+        safe_add(stdscr, max_y - 1, 0, "q: 종료", curses.color_pair(P["WHITE"]) | curses.A_DIM)
+        stdscr.refresh()
+
+        elapsed = time.monotonic() - now
+        sleep_for = FRAME_DT - elapsed
+        if sleep_for > 0:
+            time.sleep(sleep_for)
+
+
+if __name__ == "__main__":
+    curses.wrapper(main)
